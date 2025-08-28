@@ -1,0 +1,206 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  required_version = ">= 1.5.0"
+}
+
+# ---------------------------
+# Variables (with defaults)
+# ---------------------------
+variable "aws_access_key" {
+  type = string
+  description = "AWS Access Key (put it in terraform.tfvars)"
+}
+
+variable "aws_secret_key" {
+  type = string
+  description = "AWS Secret Key (put it in terraform.tfvars)"
+}
+
+variable "aws_region" {
+  type    = string
+  default = "ap-south-1"   # Mumbai
+}
+
+variable "key_name" {
+  type = string
+  description = "AWS EC2 Key Pair name present in your AWS account (no .pem) - set in terraform.tfvars"
+}
+
+variable "allow_ssh_cidr" {
+  type    = string
+  default = "0.0.0.0/0"    # For the lab; ideally replace with YOUR_IP/32
+}
+
+# ---------------------------
+# Provider - using variables
+# ---------------------------
+provider "aws" {
+  region     = var.aws_region
+  access_key = var.aws_access_key     # <-- will be read from terraform.tfvars
+  secret_key = var.aws_secret_key     # <-- will be read from terraform.tfvars
+}
+
+# ---------------------------
+# Find latest Ubuntu 22.04 LTS AMI for region
+# ---------------------------
+data "aws_ami" "ubuntu22" {
+  most_recent = true
+  owners      = ["099720109477"]   # Canonical
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+}
+
+# ---------------------------
+# Jenkins Security Group
+# ---------------------------
+resource "aws_security_group" "jenkins_sg" {
+  name        = "jenkins-sg"
+  description = "Allow SSH and Jenkins (8080)"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allow_ssh_cidr]
+  }
+
+  ingress {
+    description = "Jenkins"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "jenkins-sg" }
+}
+
+# ---------------------------
+# App (Tomcat) Security Group
+# ---------------------------
+resource "aws_security_group" "app_sg" {
+  name        = "app-sg"
+  description = "Allow SSH and Tomcat (8080)"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allow_ssh_cidr]
+  }
+
+  ingress {
+    description = "Tomcat"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "app-sg" }
+}
+
+# ---------------------------
+# Use default VPC (simpler for lab)
+# ---------------------------
+data "aws_vpc" "default" {
+  default = true
+}
+
+# ---------------------------
+# Jenkins Master Instance (user_data provisions Jenkins)
+# ---------------------------
+resource "aws_instance" "jenkins_master" {
+  ami                         = data.aws_ami.ubuntu22.id
+  instance_type               = "t3.small"
+  key_name                    = var.key_name
+  vpc_security_group_ids      = [aws_security_group.jenkins_sg.id]
+  associate_public_ip_address = true
+
+  # user_data runs when instance boots - installs Java and Jenkins
+  user_data = <<-EOF
+    #!/bin/bash
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y openjdk-17-jre-headless apt-transport-https ca-certificates curl gnupg
+    # Add Jenkins repo and install
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+    echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" \
+      | tee /etc/apt/sources.list.d/jenkins.list
+    apt-get update -y
+    apt-get install -y jenkins git maven ansible
+    systemctl enable --now jenkins
+  EOF
+
+  tags = { Name = "jenkins-master" }
+}
+
+# ---------------------------
+# Application Node (will have Ansible installed)
+# ---------------------------
+resource "aws_instance" "app_node" {
+  ami                         = data.aws_ami.ubuntu22.id
+  instance_type               = "t3.micro"
+  key_name                    = var.key_name
+  vpc_security_group_ids      = [aws_security_group.app_sg.id]
+  associate_public_ip_address = true
+
+  user_data = <<-EOF
+    #!/bin/bash
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y openjdk-17-jre-headless ansible
+    # prepare directories for future Ansible deployments
+    mkdir -p /opt/deploy
+  EOF
+
+  tags = { Name = "app-node" }
+}
+
+# ---------------------------
+# Outputs
+# ---------------------------
+output "jenkins_public_ip" {
+  description = "Public IP of Jenkins Master"
+  value       = aws_instance.jenkins_master.public_ip
+}
+
+output "app_public_ip" {
+  description = "Public IP of App Node"
+  value       = aws_instance.app_node.public_ip
+}
+
+output "jenkins_public_dns" {
+  value = aws_instance.jenkins_master.public_dns
+}
+
+output "app_public_dns" {
+  value = aws_instance.app_node.public_dns
+}
